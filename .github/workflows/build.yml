@@ -1,0 +1,241 @@
+name: Compilar APK
+on:
+  workflow_dispatch:
+  push:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Criar projeto
+        run: |
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Baixador"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2g
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.exemplo.baixador"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.exemplo.baixador"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="Baixador"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/exemplo/baixador
+          cat > app/src/main/java/com/exemplo/baixador/MainActivity.kt <<'EOF_FILE'
+          package com.exemplo.baixador
+
+          import android.app.Activity
+          import android.app.DownloadManager
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.Looper
+          import android.text.InputType
+          import android.text.format.Formatter
+          import android.view.Gravity
+          import android.webkit.URLUtil
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var dm: DownloadManager
+              private lateinit var input: EditText
+              private lateinit var adapter: ArrayAdapter<String>
+              private val ids = ArrayList<Long>()          // mais novo primeiro
+              private val rows = ArrayList<String>()
+              private val handler = Handler(Looper.getMainLooper())
+              private val tick = object : Runnable {
+                  override fun run() { refresh(); handler.postDelayed(this, 1000) }
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                  loadIds()
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(14), dp(14), dp(14), dp(14))
+                  }
+                  input = EditText(this).apply {
+                      hint = "Cole os links (um por linha)"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_VARIATION_URI
+                      minLines = 3
+                      gravity = Gravity.TOP
+                  }
+                  val btn = Button(this).apply {
+                      text = "Baixar"
+                      setOnClickListener { startDownloads() }
+                  }
+                  val hint = TextView(this).apply {
+                      text = "Toque num item concluído para abrir. Segure para cancelar/remover."
+                      textSize = 12f
+                      setPadding(0, dp(8), 0, dp(4))
+                  }
+                  adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, rows)
+                  val list = ListView(this).apply {
+                      adapter = this@MainActivity.adapter
+                      setOnItemClickListener { _, _, pos, _ -> openItem(ids[pos]) }
+                      setOnItemLongClickListener { _, _, pos, _ ->
+                          dm.remove(ids[pos]); ids.removeAt(pos); saveIds(); refresh()
+                          toast("Removido"); true
+                      }
+                  }
+                  root.addView(input)
+                  root.addView(btn)
+                  root.addView(hint)
+                  root.addView(list, LinearLayout.LayoutParams(-1, 0, 1f))
+                  setContentView(root)
+                  handleShare(intent)
+              }
+
+              override fun onNewIntent(i: Intent) { super.onNewIntent(i); handleShare(i) }
+
+              private fun handleShare(i: Intent?) {
+                  if (i?.action == Intent.ACTION_SEND) {
+                      i.getStringExtra(Intent.EXTRA_TEXT)?.let { input.setText(it) }
+                  }
+              }
+
+              override fun onResume() { super.onResume(); handler.post(tick) }
+              override fun onPause() { super.onPause(); handler.removeCallbacks(tick) }
+
+              private fun startDownloads() {
+                  val links = input.text.toString().split(Regex("\\s+")).filter { it.startsWith("http://") || it.startsWith("https://") }
+                  if (links.isEmpty()) { toast("Cole um link http ou https"); return }
+                  for (url in links) {
+                      try {
+                          val name = URLUtil.guessFileName(url, null, null)
+                          val req = DownloadManager.Request(Uri.parse(url))
+                              .setTitle(name)
+                              .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                              .setAllowedOverMetered(true)
+                              .setAllowedOverRoaming(true)
+                              .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
+                          ids.add(0, dm.enqueue(req))
+                      } catch (e: Exception) { toast("Link inválido: $url") }
+                  }
+                  input.setText(""); saveIds(); refresh()
+                  toast("${links.size} download(s) na fila. Arquivos em Downloads.")
+              }
+
+              private fun refresh() {
+                  if (ids.isEmpty()) { rows.clear(); adapter.notifyDataSetChanged(); return }
+                  val found = HashMap<Long, String>()
+                  dm.query(DownloadManager.Query().setFilterById(*ids.toLongArray()))?.use { c ->
+                      while (c.moveToNext()) {
+                          val id = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_ID))
+                          val title = c.getString(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TITLE)) ?: "arquivo"
+                          val st = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                          val got = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
+                          val tot = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
+                          val status = when (st) {
+                              DownloadManager.STATUS_PENDING -> "Na fila"
+                              DownloadManager.STATUS_RUNNING ->
+                                  if (tot > 0) "Baixando ${got * 100 / tot}% (${Formatter.formatShortFileSize(this, got)} de ${Formatter.formatShortFileSize(this, tot)})"
+                                  else "Baixando ${Formatter.formatShortFileSize(this, got)}"
+                              DownloadManager.STATUS_PAUSED -> "Pausado (aguardando rede)"
+                              DownloadManager.STATUS_SUCCESSFUL -> "Concluído"
+                              else -> "Falhou"
+                          }
+                          found[id] = "$title\n$status"
+                      }
+                  }
+                  ids.retainAll(found.keys)
+                  rows.clear(); ids.forEach { rows.add(found[it] ?: "") }
+                  adapter.notifyDataSetChanged()
+              }
+
+              private fun openItem(id: Long) {
+                  val uri = dm.getUriForDownloadedFile(id)
+                  if (uri == null) { toast("Ainda não concluído"); return }
+                  try {
+                      startActivity(Intent(Intent.ACTION_VIEW).apply {
+                          setDataAndType(uri, dm.getMimeTypeForDownloadedFile(id) ?: "*/*")
+                          addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                      })
+                  } catch (e: Exception) { toast("Nenhum app para abrir este arquivo") }
+              }
+
+              private fun saveIds() =
+                  getSharedPreferences("b", MODE_PRIVATE).edit().putString("ids", ids.joinToString(",")).apply()
+
+              private fun loadIds() {
+                  val s = getSharedPreferences("b", MODE_PRIVATE).getString("ids", "") ?: ""
+                  ids.clear(); s.split(",").mapNotNull { it.toLongOrNull() }.forEach { ids.add(it) }
+              }
+
+              private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
+          }
+          EOF_FILE
+      - name: Compilar
+        run: gradle assembleDebug --no-daemon
+      - name: Publicar APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk Baixador.apk
+          gh release create "v${{ github.run_number }}" Baixador.apk --repo "${{ github.repository }}" --title "Baixador ${{ github.run_number }}" --notes "APK pronto para instalar"
+          
